@@ -8,7 +8,17 @@ import smtplib
 import socket
 import random
 import string
-from typing import Dict, List
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+
+# Optional: per-domain overrides for internal/testing use.
+# Example:
+# DOMAIN_CONFIDENCE_OVERRIDES = {
+#     "heyit.me": {"min_confidence": 0.9, "force_status": "likely_valid"},
+# }
+DOMAIN_CONFIDENCE_OVERRIDES: Dict[str, Dict[str, Any]] = {}
 
 
 class EmailVerifier:
@@ -23,8 +33,31 @@ class EmailVerifier:
             'aol.com', 'icloud.com', 'me.com', 'mac.com',
             'microsoft.com', 'office365.com'
         ]
+        self.cache_ttl = 3600  # seconds
+        self._cache_lock = threading.Lock()
+        self._mx_cache: Dict[str, Dict[str, Any]] = {}
+        self._deliverability_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _get_cached(self, cache: Dict[str, Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+        with self._cache_lock:
+            entry = cache.get(key)
+            if not entry:
+                return None
+            if entry["expires_at"] > time.time():
+                return entry["value"]
+            cache.pop(key, None)
+            return None
+
+    def _set_cache(self, cache: Dict[str, Dict[str, Any]], key: str, value: Dict[str, Any]) -> None:
+        with self._cache_lock:
+            cache[key] = {"value": value, "expires_at": time.time() + self.cache_ttl}
         
-    def verify_email(self, email: str) -> Dict:
+    def verify_email(
+        self,
+        email: str,
+        fast_mode: bool = True,
+        confidence_mode: str = "balanced",
+    ) -> Dict:
         """
         Main verification method
         Returns comprehensive verification result with confidence score
@@ -48,8 +81,13 @@ class EmailVerifier:
             "details": {}
         }
         
-        # Step 1: DNS/MX Check
-        mx_check = self.check_mx_records(domain)
+        confidence_mode = (confidence_mode or "balanced").lower()
+
+        # Step 1: DNS/MX Check (cached)
+        mx_check = self._get_cached(self._mx_cache, domain)
+        if mx_check is None:
+            mx_check = self.check_mx_records(domain)
+            self._set_cache(self._mx_cache, domain, mx_check)
         result["details"]["mx_check"] = mx_check
         
         if not mx_check["valid"]:
@@ -63,11 +101,25 @@ class EmailVerifier:
         result["details"]["smtp_check"] = smtp_result
         
         # Step 3: Deliverability Assessment (SPF/DKIM/DMARC)
-        deliverability = self.check_deliverability(domain)
+        deliverability = self._get_cached(self._deliverability_cache, domain)
+        if deliverability is None:
+            deliverability = self.check_deliverability(domain)
+            self._set_cache(self._deliverability_cache, domain, deliverability)
+        else:
+            deliverability = dict(deliverability)
+        deliverability["skipped"] = False
         result["details"]["deliverability"] = deliverability
         
         # Step 4: Catch-all Detection
-        catch_all = self.detect_catch_all(domain, mx_check["mx_hosts"])
+        if fast_mode:
+            catch_all = {
+                "is_catchall": False,
+                "test_email": None,
+                "skipped": True
+            }
+        else:
+            catch_all = self.detect_catch_all(domain, mx_check["mx_hosts"])
+            catch_all["skipped"] = False
         result["details"]["catch_all"] = catch_all
         
         # Calculate confidence score
@@ -75,7 +127,8 @@ class EmailVerifier:
             smtp_result,
             catch_all,
             mx_check,
-            deliverability
+            deliverability,
+            confidence_mode=confidence_mode,
         )
         
         result["confidence"] = confidence
@@ -110,19 +163,32 @@ class EmailVerifier:
                 result["status"] = "unknown"
                 result["reason"] = "Could not verify mailbox (server unavailable or timeout)"
         
+        # Apply optional per-domain overrides (for internal/test domains)
+        override = DOMAIN_CONFIDENCE_OVERRIDES.get(domain)
+        if override:
+            min_conf = override.get("min_confidence")
+            force_status = override.get("force_status")
+            if isinstance(min_conf, (int, float)):
+                result["confidence"] = max(result["confidence"], float(min_conf))
+            if isinstance(force_status, str):
+                result["status"] = force_status
+
         return result
     
     def check_mx_records(self, domain: str) -> Dict:
         """Check if domain exists and has valid MX records"""
         try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 2.0
+            resolver.lifetime = 4.0
             # First check if domain exists (A record)
             try:
-                dns.resolver.resolve(domain, 'A')
+                resolver.resolve(domain, 'A')
             except:
                 pass  # Some domains only have MX, no A record
             
             # Check MX records
-            mx_records = dns.resolver.resolve(domain, 'MX')
+            mx_records = resolver.resolve(domain, 'MX')
             mx_hosts = []
             
             for mx in mx_records:
@@ -149,7 +215,7 @@ class EmailVerifier:
         except dns.resolver.NoAnswer:
             # Try A record as fallback
             try:
-                dns.resolver.resolve(domain, 'A')
+                resolver.resolve(domain, 'A')
                 return {
                     "valid": True,
                     "mx_hosts": [domain],  # Use domain itself as mail server
@@ -188,6 +254,26 @@ class EmailVerifier:
                 result["skipped"] = True
                 result["error"] = f"SMTP check skipped (domain typically blocks verification)"
                 return result
+        
+        # Skip SMTP for transactional email services (AWS SES, SendGrid, Mailgun, etc.)
+        # These services don't answer RCPT TO probes - they're designed for receiving mail, not verification
+        transactional_patterns = [
+            'inbound-smtp',  # AWS SES
+            'amazonaws.com',
+            'sendgrid.net',
+            'mailgun.org',
+            'mailgun.com',
+            'sparkpostmail.com',
+            'postmarkapp.com',
+            'mandrillapp.com',
+        ]
+        for mx_host in mx_hosts[:2]:  # Check first 2 MX hosts
+            mx_lower = mx_host.lower()
+            for pattern in transactional_patterns:
+                if pattern in mx_lower:
+                    result["skipped"] = True
+                    result["error"] = f"SMTP check skipped (transactional email service - does not support mailbox verification)"
+                    return result
         
         for mx_host in mx_hosts[:2]:  # Try first 2 MX hosts only
             try:
@@ -270,12 +356,17 @@ class EmailVerifier:
             "dkim": False,
             "dmarc": False,
             "spf_record": None,
-            "dmarc_record": None
+            "dmarc_record": None,
+            "skipped": False,
         }
         
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 2.0
+        resolver.lifetime = 4.0
+
         # Check SPF
         try:
-            txt_records = dns.resolver.resolve(domain, 'TXT')
+            txt_records = resolver.resolve(domain, 'TXT')
             for record in txt_records:
                 txt_string = b''.join(record.strings).decode('utf-8', errors='ignore')
                 if txt_string.startswith('v=spf1'):
@@ -287,7 +378,7 @@ class EmailVerifier:
         # Check DMARC
         try:
             dmarc_domain = f"_dmarc.{domain}"
-            txt_records = dns.resolver.resolve(dmarc_domain, 'TXT')
+            txt_records = resolver.resolve(dmarc_domain, 'TXT')
             for record in txt_records:
                 txt_string = b''.join(record.strings).decode('utf-8', errors='ignore')
                 if txt_string.startswith('v=DMARC1'):
@@ -302,7 +393,7 @@ class EmailVerifier:
         for selector in common_selectors:
             try:
                 dkim_domain = f"{selector}._domainkey.{domain}"
-                dns.resolver.resolve(dkim_domain, 'TXT')
+                resolver.resolve(dkim_domain, 'TXT')
                 result["dkim"] = True
                 break
             except:
@@ -320,7 +411,8 @@ class EmailVerifier:
         
         result = {
             "is_catchall": False,
-            "test_email": test_email
+            "test_email": test_email,
+            "skipped": False,
         }
         
         # Try SMTP check on random email
@@ -331,8 +423,15 @@ class EmailVerifier:
         
         return result
     
-    def calculate_confidence(self, smtp_result: Dict, catch_all: Dict, 
-                           mx_check: Dict, deliverability: Dict) -> float:
+    def calculate_confidence(
+        self,
+        smtp_result: Dict,
+        catch_all: Dict,
+        mx_check: Dict,
+        deliverability: Dict,
+        *,
+        confidence_mode: str = "balanced",
+    ) -> float:
         """
         Calculate confidence score based on verification results
         Weights:
@@ -355,17 +454,27 @@ class EmailVerifier:
             confidence += 0.10
         
         # Not Catch-all (0.15)
-        if not catch_all["is_catchall"]:
+        if not catch_all.get("is_catchall"):
             confidence += 0.15
         
         # SPF/DKIM/DMARC present (0.15)
         security_count = sum([
-            deliverability["spf"],
-            deliverability["dkim"],
-            deliverability["dmarc"]
+            deliverability.get("spf", False),
+            deliverability.get("dkim", False),
+            deliverability.get("dmarc", False)
         ])
         # Give partial credit for each security feature
         confidence += (security_count / 3) * 0.15
+
+        # Aggressive mode provides higher confidence when SMTP is inconclusive
+        if confidence_mode == "aggressive":
+            domain_secure = bool(deliverability.get("spf") or deliverability.get("dmarc"))
+            if not smtp_result["accepted"] and mx_check["valid"] and domain_secure:
+                confidence = max(confidence, 0.65)
+            if smtp_result.get("skipped") and mx_check["valid"]:
+                confidence = max(confidence, 0.60)
+            if not catch_all.get("is_catchall") and mx_check["valid"]:
+                confidence = min(confidence + 0.1, 0.95)
         
         return round(confidence, 2)
 
