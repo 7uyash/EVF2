@@ -54,12 +54,14 @@ class EmailFindRequest(BaseModel):
     include_default_patterns: bool = True
     fast_mode: bool = True
     confidence_mode: Optional[str] = "balanced"
+    internet_checks: Optional[bool] = False
 
 
 class EmailVerifyRequest(BaseModel):
     email: str
     fast_mode: bool = True
     confidence_mode: Optional[str] = "balanced"
+    internet_checks: Optional[bool] = False
 
 
 # Response models
@@ -76,6 +78,18 @@ class EmailVerifyResponse(BaseModel):
     confidence: float
     reason: str
     details: dict
+
+
+class InternetCheckRequest(BaseModel):
+    email: str
+    enable_hibp: Optional[bool] = False
+    max_google_results: Optional[int] = 5
+
+
+class InternetCheckResponse(BaseModel):
+    email: str
+    google: dict
+    hibp: dict
 
 
 @app.get("/")
@@ -110,6 +124,8 @@ async def find_email(request: EmailFindRequest):
             include_defaults=request.include_default_patterns,
             fast_mode=fast_mode,
             confidence_mode=confidence_mode,
+            # pass internet checks through to verifier if requested
+            internet_checks=bool(request.internet_checks),
         )
         
         logger.info(f"Found {len(results)} results")
@@ -136,6 +152,7 @@ async def verify_email(request: EmailVerifyRequest):
             request.email,
             fast_mode=request.fast_mode,
             confidence_mode=request.confidence_mode or "balanced",
+            internet_checks=bool(request.internet_checks),
         )
         return EmailVerifyResponse(**result)
     except Exception as e:
@@ -147,6 +164,7 @@ async def bulk_find_email(
     file: UploadFile = File(...),
     fast_mode: bool = Form(True),
     confidence_mode: str = Form("balanced"),
+    internet_checks: bool = Form(False),
 ):
     """Schedule bulk find job from CSV file"""
     temp_path = None
@@ -172,7 +190,7 @@ async def bulk_find_email(
         job_id = job_manager.create_job(
             "bulk_find",
             total_rows,
-            {"fast_mode": fast_mode, "confidence_mode": confidence_mode},
+            {"fast_mode": fast_mode, "confidence_mode": confidence_mode, "internet_checks": bool(internet_checks)},
         )
         bulk_executor.submit(
             process_bulk_find_job,
@@ -180,6 +198,7 @@ async def bulk_find_email(
             temp_path,
             fast_mode,
             confidence_mode,
+            internet_checks,
         )
         temp_path = None  # Worker owns cleanup
         
@@ -198,6 +217,7 @@ async def bulk_verify_email(
     file: UploadFile = File(...),
     fast_mode: bool = Form(True),
     confidence_mode: str = Form("balanced"),
+    internet_checks: bool = Form(False),
 ):
     """Schedule bulk verify job from CSV file"""
     temp_path = None
@@ -221,7 +241,7 @@ async def bulk_verify_email(
         job_id = job_manager.create_job(
             "bulk_verify",
             total_rows,
-            {"fast_mode": fast_mode, "confidence_mode": confidence_mode},
+            {"fast_mode": fast_mode, "confidence_mode": confidence_mode, "internet_checks": bool(internet_checks)},
         )
         bulk_executor.submit(
             process_bulk_verify_job,
@@ -229,6 +249,7 @@ async def bulk_verify_email(
             temp_path,
             fast_mode,
             confidence_mode,
+            internet_checks,
         )
         temp_path = None
         
@@ -271,6 +292,22 @@ async def get_job_status(job_id: str):
     }
 
 
+@app.post("/api/internet-check", response_model=InternetCheckResponse)
+async def internet_check_api(request: InternetCheckRequest):
+    """Perform a web-based internet presence check for the given email using Google/HIBP"""
+    try:
+        import internet_check as ic
+    except Exception:
+        # Fallback if running as package
+        from . import internet_check as ic
+
+    try:
+        data = ic.check_internet_presence(request.email, enable_hibp=bool(request.enable_hibp), max_google_results=int(request.max_google_results or 5))
+        return InternetCheckResponse(email=request.email, google=data.get('google', {}), hibp=data.get('hibp', {}))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/jobs/{job_id}/download")
 async def download_job_file(job_id: str):
     job = job_manager.get_job(job_id)
@@ -301,6 +338,7 @@ def process_bulk_find_job(
     input_path: str,
     fast_mode: bool,
     confidence_mode: str,
+    internet_checks: bool = False,
 ) -> None:
     job_manager.start_job(job_id)
     output_path = None
@@ -341,6 +379,7 @@ def process_bulk_find_job(
                         max_results=1,
                         fast_mode=fast_mode,
                         confidence_mode=confidence_mode,
+                        internet_checks=internet_checks,
                     )
                     if emails:
                         result = emails[0]
@@ -392,6 +431,7 @@ def process_bulk_verify_job(
     input_path: str,
     fast_mode: bool,
     confidence_mode: str,
+    internet_checks: bool = False,
 ) -> None:
     job_manager.start_job(job_id)
     output_path = None
@@ -423,6 +463,7 @@ def process_bulk_verify_job(
                         email,
                         fast_mode=fast_mode,
                         confidence_mode=confidence_mode,
+                        internet_checks=internet_checks,
                     )
                     writer.writerow({
                         'email': email,

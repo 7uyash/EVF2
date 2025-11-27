@@ -6,11 +6,20 @@ Handles DNS/MX checks, SMTP handshake, deliverability assessment, and catch-all 
 import dns.resolver
 import smtplib
 import socket
+import os
 import random
 import string
 import threading
 import time
 from typing import Any, Dict, List, Optional
+import logging
+import json
+try:
+    # Preferred relative import when running as a package
+    from . import internet_check as internet_check_module
+except Exception:
+    # Fall back to top-level import for test scripts or simple runs
+    import internet_check as internet_check_module
 
 
 # Optional: per-domain overrides for internal/testing use.
@@ -37,6 +46,12 @@ class EmailVerifier:
         self._cache_lock = threading.Lock()
         self._mx_cache: Dict[str, Dict[str, Any]] = {}
         self._deliverability_cache: Dict[str, Dict[str, Any]] = {}
+        # Optional toggles from environment (set to True by default to make checks mandatory)
+        # Note: HIBP requires HIBP_API_KEY env var – if missing, HIBP will be marked as skipped.
+        self.enable_internet_checks = os.getenv('ENABLE_INTERNET_CHECKS', 'true').lower() in ('1', 'true', 'yes')
+        self.hibp_enabled = os.getenv('ENABLE_HIBP', 'true').lower() in ('1', 'true', 'yes')
+        # Allow configuring sender domain for RCPT/MAIL FROM; default to the host's domain
+        self._sender_domain = os.getenv('VERIFIER_SENDER_DOMAIN') or socket.getfqdn()
 
     def _get_cached(self, cache: Dict[str, Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
         with self._cache_lock:
@@ -57,6 +72,7 @@ class EmailVerifier:
         email: str,
         fast_mode: bool = True,
         confidence_mode: str = "balanced",
+        internet_checks: bool = True,
     ) -> Dict:
         """
         Main verification method
@@ -121,6 +137,16 @@ class EmailVerifier:
             catch_all = self.detect_catch_all(domain, mx_check["mx_hosts"])
             catch_all["skipped"] = False
         result["details"]["catch_all"] = catch_all
+
+        # Step 5: Internet presence checks (Google/HIBP) — always enabled by default
+        if internet_checks or self.enable_internet_checks:
+            try:
+                result["details"]["internet_check"] = internet_check_module.check_internet_presence(
+                    email,
+                    enable_hibp=self.hibp_enabled,
+                )
+            except Exception as e:
+                result["details"]["internet_check"] = {"error": str(e)}
         
         # Calculate confidence score
         confidence = self.calculate_confidence(
@@ -290,7 +316,7 @@ class EmailVerifier:
                         server.helo()
                     
                     # MAIL FROM (use a test sender)
-                    test_sender = f"test@{domain}"
+                    test_sender = f"verify@{self._sender_domain}"
                     code, message = server.mail(test_sender)
                     if code not in [250, 251]:
                         server.quit()
@@ -302,11 +328,12 @@ class EmailVerifier:
                     server.quit()
                     
                     # Interpret response
-                    if code == 250:
+                    # Accept a 250 or 251 as success; treat 5xx codes as rejection
+                    if code in [250, 251]:
                         result["accepted"] = True
                         result["mx_used"] = mx_host
                         return result
-                    elif code == 550:
+                    elif code in [550, 553]:
                         result["rejected"] = True
                         result["error"] = "Mailbox does not exist"
                         result["mx_used"] = mx_host
@@ -319,6 +346,12 @@ class EmailVerifier:
                     elif code == 421:
                         result["error"] = "Service unavailable"
                         continue
+                    elif 500 <= code < 600:
+                        # Permanent failure (5xx) — treat as rejection
+                        result["rejected"] = True
+                        result["error"] = f"Permanent SMTP error: {code}"
+                        result["mx_used"] = mx_host
+                        return result
                     else:
                         result["error"] = f"Unexpected response: {code} {message}"
                         continue
@@ -477,4 +510,20 @@ class EmailVerifier:
                 confidence = min(confidence + 0.1, 0.95)
         
         return round(confidence, 2)
+
+
+if __name__ == '__main__':
+    # Quick-run for development testing and validation
+    logging.basicConfig(level=logging.INFO)
+    verifier = EmailVerifier()
+    test_emails = [
+        'contact@projexa.ai',
+        'hey@om-mishra.com',
+        'contact.ommishra@gmail.com',
+    ]
+    for e in test_emails:
+        print('\n---')
+        print(f'Checking: {e}')
+        res = verifier.verify_email(e, fast_mode=True, confidence_mode='balanced', internet_checks=True)
+        print(json.dumps(res, indent=2))
 

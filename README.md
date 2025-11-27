@@ -160,6 +160,25 @@ curl -X POST http://localhost:8000/api/verify \
   -d '{"email": "john.doe@example.com"}'
 ```
 
+### Internet Checks & APIs
+To enable internet checks and breach searching, set environment variables before running the backend.
+
+- `ENABLE_INTERNET_CHECKS` (bool): Enables Google/HIBP checks during verification. Default: true (the service now runs internet checks by default; set to 'false' to disable)
+- `ENABLE_HIBP` (bool): Enables Have I Been Pwned checks (requires `HIBP_API_KEY`) Default: true (HIBP is attempted by default; HIBP will be `skipped` if no API key is provided)
+- `HIBP_API_KEY` (string): API key for Have I Been Pwned (optional)
+- `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` (strings): If set, the service will use the Google Custom Search API for more reliable searches; otherwise it will fall back to a best-effort HTML scrape of Google search results
+- `VERIFIER_SENDER_DOMAIN` (string): Optional domain used as MAIL FROM during SMTP checks; defaults to local host FQDN
+
+Example (Windows PowerShell):
+```powershell
+$env:ENABLE_INTERNET_CHECKS = 'true'
+$env:ENABLE_HIBP = 'true'
+$env:HIBP_API_KEY = 'your-hibp-api-key'
+$env:GOOGLE_API_KEY = 'your-google-api-key'
+$env:GOOGLE_CSE_ID = 'your-google-cse-id'
+python backend/main.py
+```
+
 ## ⚠️ Important Notes
 
 1. **No Emails Sent**: The tool only performs SMTP handshake checks. No actual emails are sent.

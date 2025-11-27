@@ -30,14 +30,17 @@ print("   We'll check only first 3 patterns for speed...\n")
 
 # Test with just first pattern to see what happens
 if patterns:
-    test_email = patterns[0]
+    test_email = "contact@projexa.ai"
     print(f"3. Testing verification of: {test_email}")
     print("   Starting verification...\n")
     
     try:
         from email_verifier import EmailVerifier
+        import os
         verifier = EmailVerifier()
-        result = verifier.verify_email(test_email)
+        internet_checks = True
+        print(f"   Internet checks enabled: {internet_checks}")
+        result = verifier.verify_email(test_email, internet_checks=internet_checks)
         
         print("\n" + "=" * 60)
         print("VERIFICATION RESULT:")
@@ -57,6 +60,8 @@ if patterns:
                 print(f"  Deliverability: {details['deliverability']}")
             if 'catch_all' in details:
                 print(f"  Catch-all: {details['catch_all']}")
+            if internet_checks and 'internet_check' in details:
+                print(f"  Internet Check: {details['internet_check']}")
     except Exception as e:
         print(f"\nERROR during verification: {str(e)}")
         import traceback

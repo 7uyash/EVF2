@@ -147,6 +147,7 @@ class EmailFinder:
         include_defaults: bool = True,
         fast_mode: bool = True,
         confidence_mode: str = "balanced",
+        internet_checks: bool = False,
     ) -> List[Dict]:
         """
         Generate patterns, verify them, and return best matches
@@ -198,6 +199,7 @@ class EmailFinder:
                     email,
                     fast_mode=fast_mode,
                     confidence_mode=confidence_mode,
+                    internet_checks=internet_checks,
                 )
 
                 if verification["status"] in ["valid", "catch-all", "likely_valid"]:
@@ -235,6 +237,7 @@ class EmailFinder:
         include_defaults: bool = True,
         fast_mode: bool = True,
         confidence_mode: str = "balanced",
+        internet_checks: bool = False,
     ) -> Optional[Dict]:
         """
         Find single best email
@@ -248,6 +251,7 @@ class EmailFinder:
             include_defaults=include_defaults,
             fast_mode=fast_mode,
             confidence_mode=confidence_mode,
+            internet_checks=internet_checks,
         )
         return results[0] if results else None
 
